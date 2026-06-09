@@ -1,0 +1,29 @@
+version: '3.9'
+
+services:
+  api:
+    build: .
+    container_name: import-management-api
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DB_PATH: /app/data/imports.db
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: 24h
+      MALVINA_API_URL: ${MALVINA_API_URL:-https://api.malvina.gob.ar}
+      MALVINA_API_KEY: ${MALVINA_API_KEY:-}
+    volumes:
+      # Persistir la base de datos fuera del contenedor
+      - sqlite_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  sqlite_data:
+    driver: local

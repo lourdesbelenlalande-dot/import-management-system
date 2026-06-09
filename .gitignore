@@ -1,0 +1,42 @@
+# Dependencias
+node_modules/
+
+# Compilación TypeScript
+dist/
+
+# Base de datos (no versionar datos locales)
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Variables de entorno con credenciales reales
+.env
+
+# Cobertura de tests
+coverage/
+
+# Resultados de k6
+load-results.json
+load-results-summary.txt
+
+# Logs
+*.log
+npm-debug.log*
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporales de entrega
+*.zip
+generar_entregables.py
+diseno_especificacion.pdf
+plan_de_pruebas.pdf

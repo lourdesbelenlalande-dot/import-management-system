@@ -1,0 +1,177 @@
+name: CI/CD — Tests · Build · Carga · Deploy
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+# Evitar deploys simultáneos en la misma rama
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Job 1: Tests automatizados (unitarios + integración + seguridad) ───────
+  test:
+    name: "Tests (57 casos)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Ejecutar todos los tests
+        run: npm test
+        env:
+          DB_PATH: ':memory:'
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          NODE_ENV: test
+
+      - name: Generar reporte de cobertura
+        run: npm run test:coverage
+
+      - name: Subir reporte de cobertura
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+  # ── Job 2: Build TypeScript ───────────────────────────────────────────────
+  build:
+    name: "Build TypeScript"
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+
+      - name: Subir artefacto compilado
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ github.sha }}
+          path: dist/
+          retention-days: 30
+
+  # ── Job 3: Pruebas de carga con k6 (solo en main) ────────────────────────
+  load-test:
+    name: "Pruebas de carga k6"
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Seed base de datos de carga
+        run: npm run db:seed
+        env:
+          DB_PATH: './data/load-test.db'
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          NODE_ENV: test
+
+      - name: Levantar servidor en background
+        run: |
+          npm run build
+          node dist/app.js &
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
+          sleep 3
+          curl -f http://localhost:3000/health || exit 1
+        env:
+          DB_PATH: './data/load-test.db'
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          NODE_ENV: production
+          PORT: 3000
+
+      - name: Instalar k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install -y k6
+
+      - name: Ejecutar prueba de carga (smoke — 10 VUs x 1 min)
+        run: |
+          k6 run \
+            --out json=load-results.json \
+            --env BASE_URL=http://localhost:3000 \
+            --duration 1m --vus 10 \
+            load-test.js
+        # El job falla automáticamente si no se cumplen los thresholds definidos en load-test.js
+
+      - name: Subir resultados de carga
+        uses: actions/upload-artifact@v4
+        if: always()   # subir aunque k6 haya fallado
+        with:
+          name: load-test-results-${{ github.sha }}
+          path: |
+            load-results.json
+            load-results-summary.txt
+          retention-days: 30
+
+      - name: Detener servidor
+        if: always()
+        run: kill $SERVER_PID || true
+
+  # ── Job 4: Docker build + push (solo en main, después de carga) ───────────
+  docker:
+    name: "Docker build & push"
+    runs-on: ubuntu-latest
+    needs: [build, load-test]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build imagen Docker
+        run: docker build -t import-management-system:${{ github.sha }} .
+
+      - name: Login Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push imagen con tags
+        run: |
+          docker tag import-management-system:${{ github.sha }} \
+            ${{ secrets.DOCKERHUB_USERNAME }}/import-management-system:${{ github.sha }}
+          docker tag import-management-system:${{ github.sha }} \
+            ${{ secrets.DOCKERHUB_USERNAME }}/import-management-system:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/import-management-system:${{ github.sha }}
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/import-management-system:latest
+
+  # ── Job 5: Rollback automático si Docker falla ────────────────────────────
+  rollback-on-failure:
+    name: "Rollback (si docker falla)"
+    runs-on: ubuntu-latest
+    needs: docker
+    if: failure() && github.ref == 'refs/heads/main'
+    steps:
+      - name: Notificar falla y rollback
+        run: |
+          echo "ALERTA: El deploy de ${{ github.sha }} FALLO"
+          echo "Accion: Mantener la imagen :latest del commit anterior"
+          echo "SHA fallido: ${{ github.sha }}"
+          echo "Ver logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
